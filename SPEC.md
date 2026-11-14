@@ -66,6 +66,14 @@ actually goes quiet.
     earlier, but never below those base waits.
   - A segment ends anyway after 120 s.
 
+## Quiet streams
+- Optional, any number, each with a name. A quiet stream is one more quiet detector on the same audio with its own sensitivity: an offset in dB on the level that counts as quiet for **pause**, a time the quiet must have lasted before it is reported, and how much sound ends it. All three can be changed while running and apply from the next 10 ms block.
+- It reports **quiet** once per quiet stretch, when the stretch has lasted long enough, and **sound** when that stretch is over (never without a **quiet** before). Both name the stream and say where the audio went quiet and how long the quiet is; **sound** also says where the sound came back.
+- A stream uses the same judgement of "quiet" as **pause** (room noise, the speaker's level, the noise subtraction, no DC offset), moved by its offset. It has no speech model part: nothing is reported from the model's first silent frame, and sound in the trailing silence ends a quiet like any other sound.
+- It runs in and out of speech segments.
+- Streams never change **onset**, **start**, **pause**, **resume**, **end** or a segment: those are identical with and without streams. With no stream, nothing is computed for them.
+- Optionally every 10 ms block is reported with its level, the level that counts as quiet, and how far the block is from counting as quiet.
+
 ## Audio
 - The current segment's audio is available at any time while it runs:
   everything from just before speech started up to the latest sample fed. A

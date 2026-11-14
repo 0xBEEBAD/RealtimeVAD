@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.1
+
+Nothing changes for existing code: without a quiet stream the events are the
+same as in 0.1.0.
+
+### New
+
+- **Quiet streams:** `vad.add_stream("cut", offset_db=6.0, quiet_s=0.3)` adds
+  one more quiet detector to the same `VAD`, with its own sensitivity (an
+  offset on the quiet threshold `pause` uses), its own minimum length and its
+  own rule for what ends the quiet. Any number can run, each by name; every
+  setting can be changed while running. A stream reports `quiet` and `sound`
+  events with where the audio went quiet and for how long. It reuses the
+  instance's levels and noise tracking, so Silero runs once. `start`, `pause`,
+  `resume` and `end` are identical with and without streams (20 minutes of
+  meeting audio, event by event). Four streams cost about 0.5 ms per second
+  of audio. [README](README.md#quiet-streams),
+  [docs/quiet-streams.md](docs/quiet-streams.md).
+- **`block_events=True`:** a `block` event for every 10 ms block with its
+  level, the quiet threshold and `over_db`, how far the block is from
+  counting as quiet, for callers who want their own rule.
+- `benchmarks/quiet_streams.py` checks the equality and measures the cost on
+  your own WAVs.
+
 ## 0.1.0
 
 The product is the early `pause`. `end` is now exactly Silero's end, and

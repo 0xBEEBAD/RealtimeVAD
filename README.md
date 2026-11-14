@@ -2,7 +2,7 @@
 
 *An early "the speaker stopped" signal for voice assistants: 92 ms before Silero by default, 130 ms in fast mode, on a close microphone. None on a distant one.*
 
-[RealtimeSTT](https://github.com/KoljaB/RealtimeSTT) · [RealtimeTTS](https://github.com/KoljaB/RealtimeTTS) · [Live demo](https://github.com/KoljaB/RealtimeVAD/blob/main/demo/README.md) · [Results](https://github.com/KoljaB/RealtimeVAD/blob/main/docs/results.md) · [Quiet and noisy input](https://github.com/KoljaB/RealtimeVAD/blob/main/docs/quiet-and-noisy-input.md) · [Spec](https://github.com/KoljaB/RealtimeVAD/blob/main/SPEC.md) · [LiveKit plugin](https://github.com/KoljaB/RealtimeVAD/blob/main/livekit-plugins-realtimevad/README.md)
+[RealtimeSTT](https://github.com/KoljaB/RealtimeSTT) · [RealtimeTTS](https://github.com/KoljaB/RealtimeTTS) · [Live demo](https://github.com/KoljaB/RealtimeVAD/blob/main/demo/README.md) · [Results](https://github.com/KoljaB/RealtimeVAD/blob/main/docs/results.md) · [Quiet and noisy input](https://github.com/KoljaB/RealtimeVAD/blob/main/docs/quiet-and-noisy-input.md) · [Quiet streams](https://github.com/KoljaB/RealtimeVAD/blob/main/docs/quiet-streams.md) · [Spec](https://github.com/KoljaB/RealtimeVAD/blob/main/SPEC.md) · [LiveKit plugin](https://github.com/KoljaB/RealtimeVAD/blob/main/livekit-plugins-realtimevad/README.md)
 
 A voice assistant can't answer until it knows the user has stopped talking.
 Speech recognition, the LLM call and the voice output all wait for that one
@@ -151,6 +151,42 @@ brackets is the 3,153 one-speaker turns.
 
 Details and the full table: [results.md](https://github.com/KoljaB/RealtimeVAD/blob/main/docs/results.md#speech-off-pause).
 
+## Quiet streams
+
+`pause` has one sensitivity, tuned for "may the speaker be done?". When you
+also need quiet detected at another sensitivity, add a quiet stream. It is one
+more quiet detector on the same `VAD`: it reuses the level, the room noise and
+the speaker level the instance already tracks, so Silero still runs once.
+
+```python
+vad = VAD()
+cut = vad.add_stream("cut", offset_db=6.0, quiet_s=0.3)   # quiet 6 dB sooner than pause, held for 0.3 s
+
+for event in vad.feed(chunk):
+    if event.kind == "quiet" and event.stream == "cut":
+        maybe_cut(at=event.quiet.start)                  # quiet for 0.3 s now
+    elif event.kind == "sound" and event.stream == "cut":
+        note_pause(event.quiet.start, event.quiet.end)   # that quiet is over: its full length
+
+cut.offset_db = 9.0     # change any setting at any time; it applies from the next 10 ms on
+```
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `offset_db` | Added to the quiet threshold `pause` uses. `+6` counts audio as quiet 6 dB sooner; negative is stricter than `pause` | `0.0` |
+| `quiet_s` | Quiet must last this long before `quiet` is reported | `0.01` |
+| `rearm_s` | Sound this long ends the quiet; shorter sound (a click) stays inside it | `0.01` |
+
+- **Events:** `quiet` once per quiet stretch, when it has lasted `quiet_s`; `sound` when that stretch is over. Both carry the stream's name in `event.stream` and the stretch in `event.quiet` (`start`, `duration`, and `end` on `sound`). A stretch shorter than `quiet_s` reports nothing.
+- **Any number, by name:** `vad.add_stream(name, ...)`, `vad.streams[name]`, `vad.remove_stream(name)`. `stream.quiet` is the running stretch, or `None` while there is sound.
+- **Nothing else changes:** `start`, `pause`, `resume`, `end` and the segment's audio are the same with and without streams, event by event (checked on 20 minutes of meeting audio and in the tests). Without a stream nothing new runs.
+- **Runs all the time,** in and out of speech segments. `vad.in_speech` tells you which.
+- **Cost:** about 0.5 ms per second of audio, for one stream or four: 9.7 ms without a stream, 10.2 ms with one, 10.3 ms with four (one thread, Silero included, per-frame events on, 20 minutes of meeting audio).
+- **What for:** cut points for transcribing a long turn in pieces, found more easily the longer the open piece is (raise `offset_db` as it grows, or run 0, +3, +6 and +9 dB side by side and pick afterwards); a long strict quiet (`offset_db=-3, quiet_s=0.6`) as an input for turn detection next to the early `pause`; pause lengths that ignore clicks (`rearm_s=0.03`).
+- **Your own rule:** `VAD(block_events=True)` reports every 10 ms block as a `block` event; `event.block.over_db` is how far the block is from counting as quiet (at or below 0 it does). A stream is `over_db <= offset_db` plus a count.
+
+Design and limits: [docs/quiet-streams.md](https://github.com/KoljaB/RealtimeVAD/blob/main/docs/quiet-streams.md).
+
 ## Results
 
 | Measured on | Result |
@@ -201,6 +237,7 @@ earlier behaviour is still there as a setting.
 |---|---|
 | you want `pause` earlier and accept that it is more often inside the last word | `VAD(pause_mode="balanced")` or `"fast"` |
 | you want to know when the speech went on after a `pause` | `VAD(resume_events=True)` |
+| you need quiet detected at another sensitivity as well, without changing `pause` | `vad.add_stream("name", offset_db=..., quiet_s=...)` ([quiet streams](#quiet-streams)) |
 | you want the `end` sooner and accept more ends inside an utterance | `VAD(early_end=True)` |
 | you want one `pause` per stretch of speech, as in 0.0.5 | `VAD(repause_s=None)` |
 | your input is quiet or a phone line, and clean | try `VAD(normalize_to_dbfs=-30)` |

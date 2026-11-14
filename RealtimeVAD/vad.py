@@ -7,13 +7,15 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Optional
+from types import MappingProxyType
+from typing import Callable, Mapping, Optional
 
 import numpy as np
 
 from .silero import FRAME, SAMPLE_RATE
 
 BLOCK = 160  # 10 ms quiet-clock block
+BLOCK_S = BLOCK / SAMPLE_RATE
 FRAME_S = FRAME / SAMPLE_RATE
 EPS = 1e-9
 LEVEL_S = 3.0  # the speaker's level is the median of the segment's last 3 s of speech frames...
@@ -73,12 +75,84 @@ class Frame:
 
 
 @dataclass(frozen=True)
+class Quiet:
+    """One quiet stretch of a quiet stream."""
+
+    start: float  # where the audio went quiet (the beginning of the first quiet block)
+    duration: float  # on "quiet": so far; on "sound": all of it
+    end: Optional[float] = None  # where the sound came back (set on "sound")
+
+
+@dataclass(frozen=True)
+class Block:
+    """One 10 ms block as the quiet clock saw it (only with ``block_events=True``)."""
+
+    level_db: float  # dBFS, without a DC offset
+    quiet_db: float  # the quiet threshold at that moment, dBFS (-inf with the quiet clock off)
+    over_db: float  # how far the block is from counting as quiet; at or below 0 it does
+
+
+@dataclass(frozen=True)
 class Event:
-    kind: str  # "onset" | "start" | "pause" | "resume" | "end" | "frame"
+    kind: str  # "onset" | "start" | "pause" | "resume" | "end" | "frame" | "quiet" | "sound" | "block"
     time: float
     segment: Optional[Segment] = None  # set on "end"
     source: str = ""  # "pause": "quiet" (10 ms clock) or "silero" (first unvoiced frame)
     frame: Optional[Frame] = None  # set on "frame"
+    stream: str = ""  # "quiet" and "sound": the name of the quiet stream
+    quiet: Optional[Quiet] = None  # set on "quiet" and "sound"
+    block: Optional[Block] = None  # set on "block"
+
+
+class QuietStream:
+    """One more quiet detector on a ``VAD`` (``VAD.add_stream``), with its own sensitivity.
+
+    It judges every 10 ms block against the VAD's quiet threshold moved by ``offset_db`` and
+    reports "quiet" once a stretch has lasted ``quiet_s`` and "sound" when that stretch is
+    over. It reads what the VAD has learned and changes nothing there: "start", "pause",
+    "resume" and "end" are the same with and without it. It runs in and out of speech
+    segments. All three settings can be changed at any time; a change applies from the
+    next block on.
+    """
+
+    def __init__(self, name: str, offset_db: float = 0.0, quiet_s: float = BLOCK_S, rearm_s: float = BLOCK_S) -> None:
+        self.name = name
+        self.offset_db = offset_db  # added to the quiet threshold: +6 is quiet 6 dB sooner, negative is stricter
+        self.quiet_s = quiet_s  # quiet this long is reported
+        self.rearm_s = rearm_s  # sound this long ends the quiet; shorter sound (a click) stays inside it
+        self._reset()
+
+    def __repr__(self) -> str:
+        return f"QuietStream({self.name!r}, offset_db={self.offset_db}, quiet_s={self.quiet_s}, rearm_s={self.rearm_s})"
+
+    @property
+    def quiet(self) -> Optional[Quiet]:
+        """The running quiet stretch (also one shorter than ``quiet_s``), or None while there is sound."""
+        if self._start is None:
+            return None
+        return Quiet(self._start, self._now - self._start)
+
+    def _reset(self) -> None:
+        self._start: Optional[float] = None  # where the running stretch began
+        self._now = 0.0  # end of its latest quiet block
+        self._reported = False
+        self._loud = 0  # blocks of sound in a row inside the stretch
+
+    def _block(self, over_db: float, t: float, events: list) -> None:
+        if over_db <= self.offset_db:
+            if self._start is None:
+                self._start, self._reported = t - BLOCK_S, False
+            self._now, self._loud = t, 0
+            if not self._reported and t - self._start + EPS >= self.quiet_s:
+                self._reported = True
+                events.append(Event("quiet", t, stream=self.name, quiet=Quiet(self._start, t - self._start)))
+        elif self._start is not None:
+            self._loud += 1
+            if self._loud * BLOCK_S + EPS >= self.rearm_s:
+                start, end = self._start, t - self._loud * BLOCK_S
+                self._start = None
+                if self._reported:
+                    events.append(Event("sound", t, stream=self.name, quiet=Quiet(start, end - start, end)))
 
 
 class _ByMode:
@@ -154,6 +228,7 @@ class VAD:
         normalize_to_dbfs: Optional[float] = None,  # quiet input: amplify what Silero sees up to this speech level (try -30)
         normalize_max_db: float = 20.0,
         probability: Optional[Callable[[np.ndarray], float]] = None,
+        block_events: bool = False,  # "block" for every 10 ms block: its level against the quiet threshold
     ) -> None:
         if probability is None:
             from .silero import Silero
@@ -175,6 +250,10 @@ class VAD:
         self._extend = extend
         self._frame_events = frame_events
         self._onset_events = onset_events
+        self._block_events = block_events
+        # Quiet streams (add_stream): more quiet detectors on the same blocks and the same
+        # learned levels, each with its own sensitivity. They only read this instance.
+        self._streams: dict = {}
         # A "pause" is a guess. "resume" takes it back: sound came back after it (what allows a
         # new "pause": repause_s of sound clearly above the room, sound that re-arms the quiet
         # clock, or Silero hearing speech again after a silent frame). At most one per "pause";
@@ -253,6 +332,8 @@ class VAD:
         reset = getattr(self._p, "reset", None)
         if reset is not None:
             reset()
+        for stream in self._streams.values():
+            stream._reset()
         self._n = 0  # samples processed
         self._block_n = 0  # samples of the running 10 ms block...
         self._block_energy = self._frame_energy = 0.0  # ...and its and the frame's energy behind the high-pass
@@ -320,6 +401,33 @@ class VAD:
         """(armed, unbroken, quiet blocks since it armed) of the 10 ms quiet clock."""
         return self._t_quiet is not None, self._unbroken, self._quiet_blocks
 
+    @property
+    def streams(self) -> Mapping[str, QuietStream]:
+        """The quiet streams by name (read-only; see ``add_stream``)."""
+        return MappingProxyType(self._streams)
+
+    def add_stream(self, name: str, *, offset_db: float = 0.0, quiet_s: float = BLOCK_S,
+                   rearm_s: float = BLOCK_S) -> QuietStream:
+        """Add a quiet stream: one more quiet detector on this audio, with its own sensitivity.
+
+        ``offset_db`` is added to the quiet threshold "pause" uses (+6: quiet 6 dB sooner;
+        negative: stricter). ``feed`` then also returns "quiet" (the audio has been quiet for
+        ``quiet_s``) and "sound" (that quiet is over; sound shorter than ``rearm_s`` stays
+        inside it), with ``event.stream == name`` and the stretch in ``event.quiet``. Any
+        number can run; none changes "start", "pause", "resume" or "end". The returned
+        stream's settings can be changed at any time.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("a quiet stream needs a name")
+        if name in self._streams:
+            raise ValueError(f"there is already a quiet stream named {name!r}")
+        stream = self._streams[name] = QuietStream(name, offset_db, quiet_s, rearm_s)
+        return stream
+
+    def remove_stream(self, name: str) -> None:
+        """Remove a quiet stream; a quiet it had reported gets no "sound"."""
+        del self._streams[name]
+
     def audio(self) -> Optional[np.ndarray]:
         """The running segment's audio up to the latest sample fed, or None outside speech."""
         if not self._in_speech:
@@ -359,8 +467,13 @@ class VAD:
                 self._echo_until = self._n / SAMPLE_RATE + 0.5
             block = self._block_n == BLOCK
             if block:
-                self._ns_quiet = self._in_speech and self._ns_on and self._subtracted_quiet()
-            quiet = block and self._block_start(self._block_energy / BLOCK)
+                power = self._block_energy / BLOCK
+                watch = self._block_events or bool(self._streams)
+                left = self._subtracted() if (self._in_speech or watch) and self._ns_on else None
+                self._ns_quiet = self._in_speech and left is not None and left[0] <= left[1]
+                if watch:  # before this boundary's frame moves the threshold
+                    level_db, quiet_db, over_db = self._over(power, left)
+            quiet = block and self._block_start(power)
             if self._resume_due:
                 self._resume(self._n / SAMPLE_RATE, events)
             if len(self._frame_buf) == FRAME:
@@ -370,7 +483,30 @@ class VAD:
             if block:
                 self._block_n, self._block_energy = 0, 0.0
                 self._block_end(quiet, self._n / SAMPLE_RATE, events)
+                if watch:
+                    if self._block_events:
+                        events.append(Event("block", self._n / SAMPLE_RATE, block=Block(level_db, quiet_db, over_db)))
+                    for stream in self._streams.values():
+                        stream._block(over_db, self._n / SAMPLE_RATE, events)
         return events
+
+    def _over(self, power: float, left: Optional[tuple]) -> tuple:
+        """(level, quiet threshold, how far the block is from counting as quiet), dB.
+
+        At or below 0 the block is quiet by the rule the quiet clock uses: its level is at
+        most the threshold, or what the noise subtraction leaves is at most the quiet floor.
+        """
+        level_db = _dbfs(power)
+        if self._quiet <= 0:  # quiet clock off: no block is ever quiet
+            return level_db, -math.inf, math.inf
+        quiet_db = 20.0 * math.log10(self._quiet)
+        over = level_db - quiet_db
+        # exactly the quiet clock's comparison where rounding would decide
+        over = min(over, 0.0) if math.sqrt(power) <= self._quiet else max(over, 1e-9)
+        if left is not None:
+            rest = _dbfs(left[0]) - _dbfs(left[1])
+            over = min(over, min(rest, 0.0) if left[0] <= left[1] else max(rest, 1e-9))
+        return level_db, quiet_db, over
 
     def _energy(self, part: np.ndarray) -> float:
         """Energy of up to one frame of input without its DC offset (only levels use this;
@@ -393,18 +529,19 @@ class VAD:
         spectrum = np.fft.rfft(x * hann)
         return np.add.reduceat(spectrum.real ** 2 + spectrum.imag ** 2, edges) * scale
 
-    def _subtracted_quiet(self) -> bool:
-        """Is what the latest 20 ms leave above the room's spectrum below the quiet floor?"""
+    def _subtracted(self) -> Optional[tuple]:
+        """(what the latest 20 ms leave above the room's spectrum, the quiet floor) as powers:
+        quiet when the first is at most the second. None where the subtraction does not apply."""
         # only where the room is close under the floor (else the level decides, as it always
         # did) and clearly under the speaker (else it cannot be told from them)
         if (self._ns_noise_db is None or self._level_db is None
                 or not self._floor_db - NS_NEAR_DB <= self._ns_total_db <= self._level_db - NS_MIN_SNR_DB):
-            return False
+            return None
         x = np.concatenate(self._ns_parts)[-_NS_WIN:]
         if len(x) < _NS_WIN:
-            return False
+            return None
         left = float(np.sum(np.maximum(0.0, self._bands(x, _NS_BLOCK) - self._ns_noise)))
-        return left <= 10.0 ** (self._floor_db / 10.0)
+        return left, 10.0 ** (self._floor_db / 10.0)
 
     def _learn_spectrum(self, frame: np.ndarray) -> None:
         """The room's spectrum follows the frames that are not speech."""
